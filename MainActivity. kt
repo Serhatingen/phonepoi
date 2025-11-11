@@ -1,5 +1,5 @@
 // MainActivity.kt
-package com.example.povapp  // Paket adını değiştir
+package com.MobilePov.povapp  // Paket adını değiştir
 
 import android.content.Context
 import android.graphics.Bitmap
