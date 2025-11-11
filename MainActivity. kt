@@ -1,0 +1,227 @@
+// MainActivity.kt
+package com.example.povapp  // Paket adını değiştir
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import android.os.Bundle
+import android.view.MotionEvent
+import android.view.SurfaceHolder
+import android.view.SurfaceView
+import android.widget.Button
+import android.widget.EditText
+import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
+import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.toDegrees
+
+class MainActivity : AppCompatActivity(), SensorEventListener {
+
+    private lateinit var sensorManager: SensorManager
+    private var gyroscope: Sensor? = null
+    private var accelerometer: Sensor? = null
+    private var magneticSensor: Sensor? = null
+
+    private lateinit var surfaceView: SurfaceView
+    private var povBitmap: Bitmap? = null
+    private var centerX: Float = 0f
+    private var centerY: Float = 0f
+    private var currentAngle: Float = 0f
+    private var angularSpeed: Float = 0f
+    private var magneticHeading: Float = 0f
+    private val accelValues = FloatArray(3)
+    private val magValues = FloatArray(3)
+    private var lastTimestamp: Long = 0L
+
+    private lateinit var kalman: KalmanFilter
+
+    private val matrixWidth = 3
+    private val matrixHeight = 200  // Cihazına göre artır
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        val editText = findViewById<EditText>(R.id.edit_text)
+        val button = findViewById<Button>(R.id.button_start)
+        surfaceView = findViewById<SurfaceView>(R.id.surface_view)
+
+        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+        accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        magneticSensor = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
+
+        kalman = KalmanFilter(processNoise = 0.05f, measurementNoise = 5f)
+
+        // Dokunma ile merkez belirle
+        surfaceView.setOnTouchListener { _, event ->
+            if (event.action == MotionEvent.ACTION_DOWN) {
+                centerX = event.x
+                centerY = event.y
+                Toast.makeText(this, "Center set at ($centerX, $centerY)", Toast.LENGTH_SHORT).show()
+            }
+            true
+        }
+
+        button.setOnClickListener {
+            val text = editText.text.toString()
+            if (text.isNotEmpty()) {
+                povBitmap = createBitmapFromText(text)
+                startPovMode()
+            } else {
+                Toast.makeText(this, "Enter some text", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    private fun createBitmapFromText(text: String): Bitmap {
+        val bitmap = Bitmap.createBitmap(matrixWidth, matrixHeight, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val paint = Paint().apply {
+            color = Color.WHITE
+            textSize = 20f
+            isAntiAlias = true
+        }
+        // Basitçe metni çiz, ama gerçekte font rasterize et (daha iyi library kullanabilirsin)
+        // Burada basit: Metni dikey sütunlara dönüştür, ama örnek için drawText kullan
+        val textWidth = paint.measureText(text)
+        canvas.drawText(text, (matrixWidth / 2f) - textWidth / 2, matrixHeight / 2f, paint)  // Merkezle, ama gerçek POV için piksel matris yap
+        return bitmap
+    }
+
+    private fun startPovMode() {
+        val holder = surfaceView.holder
+        holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                Thread { drawLoop(holder) }.start()
+            }
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
+            override fun surfaceDestroyed(holder: SurfaceHolder) {}
+        })
+    }
+
+    private fun drawLoop(holder: SurfaceHolder) {
+        while (povBitmap != null) {
+            if (abs(angularSpeed) > 0.1f) {  // Dönüş algıla
+                val canvas = holder.lockCanvas()
+                if (canvas != null) {
+                    drawPovColumn(canvas)
+                    holder.unlockCanvasAndPost(canvas)
+                }
+            }
+            Thread.sleep(16)  // ~60 FPS
+        }
+    }
+
+    private fun drawPovColumn(canvas: Canvas) {
+        canvas.drawColor(Color.BLACK)  // Ekranı temizle
+        if (povBitmap == null) return
+        val columnIndex = ((currentAngle / 360f) * matrixWidth).toInt() % matrixWidth
+        for (y in 0 until matrixHeight) {
+            val pixel = povBitmap!!.getPixel(columnIndex, y)
+            // Dar sütun çiz, merkezle
+            canvas.drawPoint(centerX, centerY + y - (matrixHeight / 2f), Paint().apply { color = pixel })
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        sensorManager.registerListener(this, gyroscope, SensorManager.SENSOR_DELAY_GAME)
+        sensorManager.registerListener(this, accelerometer, SensorManager.SENSOR_DELAY_GAME)
+        sensorManager.registerListener(this, magneticSensor, SensorManager.SENSOR_DELAY_GAME)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        sensorManager.unregisterListener(this)
+    }
+
+    override fun onSensorChanged(event: SensorEvent?) {
+        when (event?.sensor?.type) {
+            Sensor.TYPE_GYROSCOPE -> {
+                angularSpeed = event.values[2]
+                if (lastTimestamp != 0L) {
+                    val deltaTime = (event.timestamp - lastTimestamp) / 1_000_000_000f
+                    kalman.predict(deltaTime, angularSpeed)
+                }
+                lastTimestamp = event.timestamp
+                currentAngle = kalman.getAngle()
+            }
+            Sensor.TYPE_ACCELEROMETER -> {
+                System.arraycopy(event.values, 0, accelValues, 0, 3)
+                updateOrientation()
+            }
+            Sensor.TYPE_MAGNETIC_FIELD -> {
+                System.arraycopy(event.values, 0, magValues, 0, 3)
+                updateOrientation()
+            }
+        }
+    }
+
+    private fun updateOrientation() {
+        val rotationMatrix = FloatArray(9)
+        if (SensorManager.getRotationMatrix(rotationMatrix, null, accelValues, magValues)) {
+            val orientation = FloatArray(3)
+            SensorManager.getOrientation(rotationMatrix, orientation)
+            magneticHeading = toDegrees(orientation[0].toDouble()).toFloat()
+            if (magneticHeading < 0) magneticHeading += 360f
+            kalman.update(magneticHeading)
+            currentAngle = kalman.getAngle()
+        }
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
+        // Handle accuracy changes if needed
+    }
+
+    inner class KalmanFilter(private val processNoise: Float, private val measurementNoise: Float) {
+        private val state = FloatArray(2)  // [angle, angular_velocity]
+        private val covariance = FloatArray(4)  // 2x2 flattened
+
+        init {
+            covariance[0] = 1000f
+            covariance[3] = 1000f
+        }
+
+        fun predict(deltaTime: Float, angularSpeed: Float) {
+            state[0] += state[1] * deltaTime
+            state[1] = angularSpeed
+
+            val dt = deltaTime
+            val p00 = covariance[0] + dt * (covariance[2] + dt * covariance[3] + covariance[1])
+            val p01 = covariance[1] + dt * covariance[3]
+            val p10 = covariance[2] + dt * covariance[3]
+            val p11 = covariance[3]
+            covariance[0] = p00 + processNoise
+            covariance[1] = p01
+            covariance[2] = p10
+            covariance[3] = p11 + processNoise
+        }
+
+        fun update(measurement: Float) {
+            val innovation = measurement - state[0]
+            val s = covariance[0] + measurementNoise
+            val k0 = covariance[0] / s
+            val k1 = covariance[2] / s
+
+            state[0] += k0 * innovation
+            state[1] += k1 * innovation
+
+            val temp0 = covariance[0]
+            val temp1 = covariance[1]
+            covariance[0] -= k0 * temp0
+            covariance[1] -= k0 * temp1
+            covariance[2] -= k1 * temp0
+            covariance[3] -= k1 * temp1
+        }
+
+        fun getAngle(): Float = state[0] % 360f
+    }
+}
